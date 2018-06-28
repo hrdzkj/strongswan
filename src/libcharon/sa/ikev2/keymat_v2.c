@@ -306,7 +306,7 @@ failure:
 
 METHOD(keymat_v2_t, derive_ike_keys, bool,
 	private_keymat_v2_t *this, proposal_t *proposal, diffie_hellman_t *dh,
-	chunk_t nonce_i, chunk_t nonce_r, ike_sa_id_t *id,
+	qske_t *qske, chunk_t nonce_i, chunk_t nonce_r, ike_sa_id_t *id,
 	pseudo_random_function_t rekey_function, chunk_t rekey_skd)
 {
 	chunk_t skeyseed = chunk_empty, key, secret, full_nonce, fixed_nonce;
@@ -318,7 +318,14 @@ METHOD(keymat_v2_t, derive_ike_keys, bool,
 	spi_i = chunk_alloca(sizeof(uint64_t));
 	spi_r = chunk_alloca(sizeof(uint64_t));
 
-	if (!dh->get_shared_secret(dh, &secret))
+	if (qske)
+	{
+		if (!qske->get_shared_secret(qske, &secret))
+		{
+			return FALSE;
+		}
+	}
+	else if (!dh->get_shared_secret(dh, &secret))
 	{
 		return FALSE;
 	}
@@ -342,7 +349,8 @@ METHOD(keymat_v2_t, derive_ike_keys, bool,
 		chunk_clear(&secret);
 		return FALSE;
 	}
-	DBG4(DBG_IKE, "shared Diffie Hellman secret %B", &secret);
+	DBG4(DBG_IKE, "shared %s secret %B", qske ? "QSKE" : "Diffie Hellman",
+		 &secret);
 	/* full nonce is used as seed for PRF+ ... */
 	full_nonce = chunk_cat("cc", nonce_i, nonce_r);
 	/* but the PRF may need a fixed key which only uses the first bytes of
