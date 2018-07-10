@@ -24,6 +24,7 @@
 #include <encoding/payloads/auth_payload.h>
 #include <encoding/payloads/eap_payload.h>
 #include <encoding/payloads/nonce_payload.h>
+#include <sa/ikev2/keymat_v2.h>
 #include <sa/ikev2/authenticators/eap_authenticator.h>
 #include <processing/jobs/delete_ike_sa_job.h>
 
@@ -60,14 +61,14 @@ struct private_ike_auth_t {
 	chunk_t other_nonce;
 
 	/**
-	 * IKE_SA_INIT message sent by us
+	 * Data of initial packets sent by us
 	 */
-	packet_t *my_packet;
+	chunk_t my_packets;
 
 	/**
-	 * IKE_SA_INIT message sent by peer
+	 * Data of initial packets sent by peer
 	 */
-	packet_t *other_packet;
+	chunk_t other_packets;
 
 	/**
 	 * Reserved bytes of ID payload
@@ -154,13 +155,6 @@ static status_t collect_my_init_data(private_ike_auth_t *this,
 		return FAILED;
 	}
 	this->my_nonce = nonce->get_nonce(nonce);
-
-	/* pre-generate the message, keep a copy */
-	if (this->ike_sa->generate_message(this->ike_sa, message,
-									   &this->my_packet) != SUCCESS)
-	{
-		return FAILED;
-	}
 	return NEED_MORE;
 }
 
@@ -180,9 +174,6 @@ static status_t collect_other_init_data(private_ike_auth_t *this,
 		return FAILED;
 	}
 	this->other_nonce = nonce->get_nonce(nonce);
-
-	/* keep a copy of the received packet */
-	this->other_packet = message->get_packet(message);
 	return NEED_MORE;
 }
 
@@ -429,7 +420,7 @@ METHOD(task_t, build_i, status_t,
 			return NEED_MORE;
 	}
 
-	if (this->peer_cfg == NULL)
+	if (!this->peer_cfg)
 	{
 		this->peer_cfg = this->ike_sa->get_peer_cfg(this->ike_sa);
 		this->peer_cfg->get_ref(this->peer_cfg);
@@ -455,8 +446,18 @@ METHOD(task_t, build_i, status_t,
 		return NEED_MORE;
 	}
 
+	if (!this->my_packets.ptr)
+	{
+		keymat_v2_t *keymat;
+
+		keymat = (keymat_v2_t*)this->ike_sa->get_keymat(this->ike_sa);
+		this->my_packets = keymat->get_packets(keymat, TRUE);
+		this->other_packets = keymat->get_packets(keymat, FALSE);
+		keymat->clear_packets(keymat);
+	}
+
 	/* check if an authenticator is in progress */
-	if (this->my_auth == NULL)
+	if (!this->my_auth)
 	{
 		identification_t *idi, *idr = NULL;
 		id_payload_t *id_payload;
@@ -512,10 +513,9 @@ METHOD(task_t, build_i, status_t,
 
 		/* build authentication data */
 		this->my_auth = authenticator_create_builder(this->ike_sa, cfg,
-							this->other_nonce, this->my_nonce,
-							this->other_packet->get_data(this->other_packet),
-							this->my_packet->get_data(this->my_packet),
-							this->reserved);
+										this->other_nonce, this->my_nonce,
+										this->other_packets, this->my_packets,
+										this->reserved);
 		if (!this->my_auth)
 		{
 			charon->bus->alert(charon->bus, ALERT_LOCAL_AUTH_FAILED);
@@ -568,7 +568,7 @@ METHOD(task_t, process_r, status_t,
 			return NEED_MORE;
 	}
 
-	if (this->my_auth == NULL && this->do_another_auth)
+	if (!this->my_auth && this->do_another_auth)
 	{
 		/* handle (optional) IDr payload, apply proposed identity */
 		id_payload = (id_payload_t*)message->get_payload(message, PLV2_ID_RESPONDER);
@@ -606,7 +606,17 @@ METHOD(task_t, process_r, status_t,
 		this->first_auth = TRUE;
 	}
 
-	if (this->other_auth == NULL)
+	if (!this->my_packets.ptr)
+	{
+		keymat_v2_t *keymat;
+
+		keymat = (keymat_v2_t*)this->ike_sa->get_keymat(this->ike_sa);
+		this->my_packets = keymat->get_packets(keymat, TRUE);
+		this->other_packets = keymat->get_packets(keymat, FALSE);
+		keymat->clear_packets(keymat);
+	}
+
+	if (!this->other_auth)
 	{
 		/* handle IDi payload */
 		id_payload = (id_payload_t*)message->get_payload(message, PLV2_ID_INITIATOR);
@@ -665,10 +675,9 @@ METHOD(task_t, process_r, status_t,
 
 		/* verify authentication data */
 		this->other_auth = authenticator_create_verifier(this->ike_sa,
-							message, this->other_nonce, this->my_nonce,
-							this->other_packet->get_data(this->other_packet),
-							this->my_packet->get_data(this->my_packet),
-							this->reserved);
+									message, this->other_nonce, this->my_nonce,
+									this->other_packets, this->my_packets,
+									this->reserved);
 		if (!this->other_auth)
 		{
 			this->authentication_failed = TRUE;
@@ -800,10 +809,9 @@ METHOD(task_t, build_r, status_t,
 		{
 			/* build authentication data */
 			this->my_auth = authenticator_create_builder(this->ike_sa, cfg,
-								this->other_nonce, this->my_nonce,
-								this->other_packet->get_data(this->other_packet),
-								this->my_packet->get_data(this->my_packet),
-								this->reserved);
+										this->other_nonce, this->my_nonce,
+										this->other_packets, this->my_packets,
+										this->reserved);
 			if (!this->my_auth)
 			{
 				goto local_auth_failed;
@@ -1085,10 +1093,9 @@ METHOD(task_t, process_i, status_t,
 			{
 				/* verify authentication data */
 				this->other_auth = authenticator_create_verifier(this->ike_sa,
-								message, this->other_nonce, this->my_nonce,
-								this->other_packet->get_data(this->other_packet),
-								this->my_packet->get_data(this->my_packet),
-								this->reserved);
+									message, this->other_nonce, this->my_nonce,
+									this->other_packets, this->my_packets,
+									this->reserved);
 				if (!this->other_auth)
 				{
 					goto peer_auth_failed;
@@ -1218,16 +1225,14 @@ METHOD(task_t, migrate, void,
 {
 	chunk_free(&this->my_nonce);
 	chunk_free(&this->other_nonce);
-	DESTROY_IF(this->my_packet);
-	DESTROY_IF(this->other_packet);
+	chunk_free(&this->my_packets);
+	chunk_free(&this->other_packets);
 	DESTROY_IF(this->peer_cfg);
 	DESTROY_IF(this->my_auth);
 	DESTROY_IF(this->other_auth);
 	DESTROY_IF(this->redirect_to);
 	this->candidates->destroy_offset(this->candidates, offsetof(peer_cfg_t, destroy));
 
-	this->my_packet = NULL;
-	this->other_packet = NULL;
 	this->ike_sa = ike_sa;
 	this->peer_cfg = NULL;
 	this->my_auth = NULL;
@@ -1245,8 +1250,8 @@ METHOD(task_t, destroy, void,
 {
 	chunk_free(&this->my_nonce);
 	chunk_free(&this->other_nonce);
-	DESTROY_IF(this->my_packet);
-	DESTROY_IF(this->other_packet);
+	chunk_free(&this->my_packets);
+	chunk_free(&this->other_packets);
 	DESTROY_IF(this->my_auth);
 	DESTROY_IF(this->other_auth);
 	DESTROY_IF(this->peer_cfg);
