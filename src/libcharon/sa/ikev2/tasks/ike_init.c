@@ -1185,12 +1185,15 @@ METHOD(task_t, get_type, task_type_t,
 METHOD(task_t, migrate, void,
 	private_ike_init_t *this, ike_sa_t *ike_sa)
 {
-	DESTROY_IF(this->proposal);
-	chunk_free(&this->other_nonce);
+	if (!this->qske)
+	{	/* only do this if migrate is called due to a failed DH exchange */
+		DESTROY_IF(this->proposal);
+		this->proposal = NULL;
+		chunk_free(&this->other_nonce);
+	}
 
 	this->ike_sa = ike_sa;
 	this->keymat = (keymat_v2_t*)ike_sa->get_keymat(ike_sa);
-	this->proposal = NULL;
 	this->dh_failed = FALSE;
 	this->qske_failed = FALSE;
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2015-2016 Tobias Brunner
+ * Copyright (C) 2015-2018 Tobias Brunner
  * Copyright (C) 2005-2008 Martin Willi
  * Copyright (C) 2005 Jan Hutter
  * HSR Hochschule fuer Technik Rapperswil
@@ -164,7 +164,7 @@ METHOD(task_t, build_i, status_t,
 	ike_version_t version;
 
 	/* create new SA only on first try */
-	if (this->new_sa == NULL)
+	if (!this->new_sa)
 	{
 		version = this->ike_sa->get_version(this->ike_sa);
 		this->new_sa = charon->ike_sa_manager->checkout_new(
@@ -223,30 +223,55 @@ static bool have_half_open_children(private_ike_rekey_t *this)
 METHOD(task_t, process_r, status_t,
 	private_ike_rekey_t *this, message_t *message)
 {
-	if (this->ike_sa->get_state(this->ike_sa) == IKE_DELETING)
-	{
-		DBG1(DBG_IKE, "peer initiated rekeying, but we are deleting");
-		this->failed_temporarily = TRUE;
-		return NEED_MORE;
-	}
-	if (have_half_open_children(this))
-	{
-		DBG1(DBG_IKE, "peer initiated rekeying, but a child is half-open");
-		this->failed_temporarily = TRUE;
-		return NEED_MORE;
-	}
+	status_t status;
 
-	this->new_sa = charon->ike_sa_manager->checkout_new(charon->ike_sa_manager,
-							this->ike_sa->get_version(this->ike_sa), FALSE);
-	if (!this->new_sa)
-	{	/* shouldn't happen */
-		return FAILED;
+	if (this->new_sa)
+	{	/* we already processed the initial CREATE_CHILD_SA request */
+		charon->bus->set_sa(charon->bus, this->new_sa);
+		status = this->ike_init->task.process(&this->ike_init->task, message);
 	}
-	this->new_sa->inherit_pre(this->new_sa, this->ike_sa);
-	this->ike_init = ike_init_create(this->new_sa, FALSE, this->ike_sa);
-	this->ike_init->task.process(&this->ike_init->task, message);
+	else
+	{
+		if (this->ike_sa->get_state(this->ike_sa) == IKE_DELETING)
+		{
+			DBG1(DBG_IKE, "peer initiated rekeying, but we are deleting");
+			this->failed_temporarily = TRUE;
+			return NEED_MORE;
+		}
+		if (have_half_open_children(this))
+		{
+			DBG1(DBG_IKE, "peer initiated rekeying, but a child is half-open");
+			this->failed_temporarily = TRUE;
+			return NEED_MORE;
+		}
+		this->new_sa = charon->ike_sa_manager->checkout_new(
+								charon->ike_sa_manager,
+								this->ike_sa->get_version(this->ike_sa), FALSE);
+		if (!this->new_sa)
+		{	/* shouldn't happen */
+			return FAILED;
+		}
+		this->new_sa->inherit_pre(this->new_sa, this->ike_sa);
+		this->ike_init = ike_init_create(this->new_sa, FALSE, this->ike_sa);
+		status = this->ike_init->task.process(&this->ike_init->task, message);
+	}
+	charon->bus->set_sa(charon->bus, this->ike_sa);
+	return status;
+}
 
-	return NEED_MORE;
+/**
+ * Establish the new IKE_SA as responder
+ */
+static void establish_responder(private_ike_rekey_t *this)
+{
+	if (this->ike_sa->get_state(this->ike_sa) != IKE_REKEYING)
+	{	/* in case of a collision we let the initiating task handle this */
+		establish_new(this);
+		/* make sure the IKE_SA is gone in case the peer fails to delete it */
+		lib->scheduler->schedule_job(lib->scheduler, (job_t*)
+			delete_ike_sa_job_create(this->ike_sa->get_id(this->ike_sa), TRUE),
+									 90);
+	}
 }
 
 METHOD(task_t, build_r, status_t,
@@ -257,30 +282,46 @@ METHOD(task_t, build_r, status_t,
 		message->add_notify(message, TRUE, TEMPORARY_FAILURE, chunk_empty);
 		return SUCCESS;
 	}
-	if (this->new_sa == NULL)
+	if (!this->new_sa)
 	{
 		/* IKE_SA/a CHILD_SA is in an unacceptable state, deny rekeying */
 		message->add_notify(message, TRUE, NO_PROPOSAL_CHOSEN, chunk_empty);
 		return SUCCESS;
 	}
-	if (this->ike_init->task.build(&this->ike_init->task, message) == FAILED)
+
+	charon->bus->set_sa(charon->bus, this->new_sa);
+	switch (this->ike_init->task.build(&this->ike_init->task, message))
 	{
-		this->ike_init->task.destroy(&this->ike_init->task);
-		this->ike_init = NULL;
-		charon->bus->set_sa(charon->bus, this->ike_sa);
-		return SUCCESS;
+		case FAILED:
+			this->ike_init->task.destroy(&this->ike_init->task);
+			this->ike_init = NULL;
+			charon->bus->set_sa(charon->bus, this->ike_sa);
+			return SUCCESS;
+		case NEED_MORE:
+			charon->bus->set_sa(charon->bus, this->ike_sa);
+			return NEED_MORE;
+		default:
+			charon->bus->set_sa(charon->bus, this->ike_sa);
+			break;
 	}
+	establish_responder(this);
+	return SUCCESS;
+}
+
+METHOD(task_t, post_build_r, status_t,
+	private_ike_rekey_t *this, message_t *message)
+{
+	status_t status;
+
+	charon->bus->set_sa(charon->bus, this->new_sa);
+	status = this->ike_init->task.post_build(&this->ike_init->task, message);
 	charon->bus->set_sa(charon->bus, this->ike_sa);
 
-	if (this->ike_sa->get_state(this->ike_sa) != IKE_REKEYING)
-	{	/* in case of a collision we let the initiating task handle this */
-		establish_new(this);
-		/* make sure the IKE_SA is gone in case the peer fails to delete it */
-		lib->scheduler->schedule_job(lib->scheduler, (job_t*)
-			delete_ike_sa_job_create(this->ike_sa->get_id(this->ike_sa), TRUE),
-									 90);
+	if (status == SUCCESS)
+	{
+		establish_responder(this);
 	}
-	return SUCCESS;
+	return status;
 }
 
 /**
@@ -329,7 +370,7 @@ METHOD(task_t, process_i, status_t,
 			}
 			return SUCCESS;
 		case NEED_MORE:
-			/* bad dh group, try again */
+			/* bad dh group or QSKE, try again */
 			this->ike_init->task.migrate(&this->ike_init->task, this->new_sa);
 			return NEED_MORE;
 		default:
@@ -511,6 +552,10 @@ ike_rekey_t *ike_rekey_create(ike_sa_t *ike_sa, bool initiator)
 	{
 		this->public.task.build = _build_i;
 		this->public.task.process = _process_i;
+	}
+	else
+	{
+		this->public.task.post_build = _post_build_r;
 	}
 
 	return &this->public;
