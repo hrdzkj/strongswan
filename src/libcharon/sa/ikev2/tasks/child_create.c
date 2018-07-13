@@ -24,6 +24,7 @@
 #include <encoding/payloads/sa_payload.h>
 #include <encoding/payloads/ke_payload.h>
 #include <encoding/payloads/ts_payload.h>
+#include <encoding/payloads/qske_payload.h>
 #include <encoding/payloads/nonce_payload.h>
 #include <encoding/payloads/notify_payload.h>
 #include <encoding/payloads/delete_payload.h>
@@ -117,6 +118,11 @@ struct private_child_create_t {
 	 * group used for DH exchange
 	 */
 	diffie_hellman_group_t dh_group;
+
+	/**
+	 * QSKE mechanism implementation
+	 */
+	qske_t *qske;
 
 	/**
 	 * IKE_SAs keymat
@@ -508,6 +514,7 @@ static status_t select_data(private_child_create_t *this,
 {
 	linked_list_t *my_ts, *other_ts;
 	host_t *me, *other;
+	uint16_t qske_mechanism;
 	bool private, prefer_configured;
 
 	if (!this->proposals)
@@ -569,6 +576,18 @@ static status_t select_data(private_child_create_t *this,
 		DESTROY_IF(this->dh);
 		this->dh = NULL;
 		this->dh_group = MODP_NONE;
+	}
+
+	if (!ike_auth &&
+		this->proposal->get_algorithm(this->proposal, QSKE_MECHANISM,
+									  &qske_mechanism, NULL))
+	{
+		this->qske = this->keymat->create_qske(this->keymat, qske_mechanism);
+		if (!this->qske)
+		{
+			DBG1(DBG_IKE, "creating QSKE implementation failed");
+			return FAILED;
+		}
 	}
 
 	if (this->initiator)
@@ -726,7 +745,7 @@ static status_t install_child_sa(private_child_create_t *this)
 
 	status_i = status_o = FAILED;
 	if (this->keymat->derive_child_keys(this->keymat, this->proposal, this->dh,
-			NULL, nonce_i, nonce_r, &encr_i, &integ_i, &encr_r, &integ_r))
+			this->qske, nonce_i, nonce_r, &encr_i, &integ_i, &encr_r, &integ_r))
 	{
 		if (this->initiator)
 		{
@@ -1046,6 +1065,22 @@ static void process_payloads(private_child_create_t *this, message_t *message)
 	enumerator->destroy(enumerator);
 }
 
+METHOD(task_t, build_i_qske, status_t,
+	private_child_create_t *this, message_t *message)
+{
+	qske_payload_t *qske;
+
+	message->set_exchange_type(message, IKE_AUX);
+	qske = qske_payload_create_from_qske(this->qske, TRUE);
+	if (!qske)
+	{
+		DBG1(DBG_IKE, "failed to create QSKE payload");
+		return SUCCESS;
+	}
+	message->add_payload(message, (payload_t*)qske);
+	return NEED_MORE;
+}
+
 METHOD(task_t, build_i, status_t,
 	private_child_create_t *this, message_t *message)
 {
@@ -1053,6 +1088,7 @@ METHOD(task_t, build_i, status_t,
 	host_t *vip;
 	peer_cfg_t *peer_cfg;
 	linked_list_t *list;
+	bool no_dh = TRUE;
 
 	switch (message->get_exchange_type(message))
 	{
@@ -1061,14 +1097,13 @@ METHOD(task_t, build_i, status_t,
 		case CREATE_CHILD_SA:
 			if (!generate_nonce(this))
 			{
-				message->add_notify(message, FALSE, NO_PROPOSAL_CHOSEN,
-									chunk_empty);
 				return SUCCESS;
 			}
 			if (!this->retry && this->dh_group == MODP_NONE)
 			{	/* during a rekeying the group might already be set */
 				this->dh_group = this->config->get_dh_group(this->config);
 			}
+			no_dh = FALSE;
 			break;
 		case IKE_AUTH:
 			/* send only in the first request, not in subsequent rounds */
@@ -1121,8 +1156,7 @@ METHOD(task_t, build_i, status_t,
 		this->tsr->insert_first(this->tsr,
 								this->packet_tsr->clone(this->packet_tsr));
 	}
-	this->proposals = this->config->get_proposals(this->config,
-												  this->dh_group == MODP_NONE);
+	this->proposals = this->config->get_proposals(this->config, no_dh);
 	this->mode = this->config->get_mode(this->config);
 
 	this->child_sa = child_sa_create(this->ike_sa->get_my_host(this->ike_sa),
@@ -1192,6 +1226,36 @@ METHOD(task_t, build_i, status_t,
 	this->tsr = NULL;
 	this->proposals = NULL;
 
+	return NEED_MORE;
+}
+
+METHOD(task_t, process_r_qske, status_t,
+	private_child_create_t *this, message_t *message)
+{
+	qske_payload_t *qske;
+
+	if (message->get_exchange_type(message) == IKE_AUX)
+	{
+		qske = (qske_payload_t*)message->get_payload(message, PLV2_QSKE);
+		if (qske)
+		{
+			if (this->qske->set_public_key(this->qske,
+										   qske->get_qske_data(qske)))
+			{
+				return NEED_MORE;
+			}
+			else
+			{
+				DBG1(DBG_IKE, "failed to set QSKE public key");
+			}
+		}
+		else
+		{
+			DBG1(DBG_IKE, "QSKE payload missing in message");
+		}
+	}
+	DESTROY_IF(this->qske);
+	this->qske = NULL;
 	return NEED_MORE;
 }
 
@@ -1312,6 +1376,47 @@ static child_cfg_t* select_child_cfg(private_child_create_t *this)
 	}
 
 	return child_cfg;
+}
+
+METHOD(task_t, build_r_qske, status_t,
+	private_child_create_t *this, message_t *message)
+{
+	qske_payload_t *qske;
+
+	if (!this->qske)
+	{
+		/* FIXME: does this error make sense? */
+		message->add_notify(message, FALSE, NO_PROPOSAL_CHOSEN, chunk_empty);
+		handle_child_sa_failure(this, message);
+		return SUCCESS;
+	}
+
+	/* this actually generates the secret, so we call it before deriving keys */
+	qske = qske_payload_create_from_qske(this->qske, FALSE);
+	if (qske)
+	{
+		if (install_child_sa(this) == SUCCESS)
+		{
+			message->add_payload(message, (payload_t*)qske);
+			if (!this->rekey)
+			{	/* invoke the child_up() hook if we are not rekeying */
+				charon->bus->child_updown(charon->bus, this->child_sa, TRUE);
+			}
+			return SUCCESS;
+		}
+		else
+		{
+			qske->destroy(qske);
+		}
+	}
+	else
+	{
+		DBG1(DBG_IKE, "failed to create QSKE payload");
+	}
+	/* FIXME: does this error make sense? */
+	message->add_notify(message, FALSE, NO_PROPOSAL_CHOSEN, chunk_empty);
+	handle_child_sa_failure(this, message);
+	return SUCCESS;
 }
 
 METHOD(task_t, build_r, status_t,
@@ -1441,6 +1546,12 @@ METHOD(task_t, build_r, status_t,
 			return SUCCESS;
 		}
 		case SUCCESS:
+			if (this->qske)
+			{	/* can't install the CHILD_SA yet, handle IKE_AUX first */
+				this->public.task.build = _build_r_qske;
+				this->public.task.process = _process_r_qske;
+				break;
+			}
 			if (install_child_sa(this) == SUCCESS)
 			{
 				break;
@@ -1458,6 +1569,11 @@ METHOD(task_t, build_r, status_t,
 		message->add_notify(message, FALSE, NO_PROPOSAL_CHOSEN, chunk_empty);
 		handle_child_sa_failure(this, message);
 		return SUCCESS;
+	}
+
+	if (!this->established)
+	{	/* wait for an IKE_AUX exchange */
+		return NEED_MORE;
 	}
 
 	if (!this->rekey)
@@ -1516,6 +1632,46 @@ static status_t delete_failed_sa(private_child_create_t *this)
 		return NEED_MORE;
 	}
 	return SUCCESS;
+}
+
+/**
+ * Install the CHILD_SA as initiator
+ */
+static status_t install_child_sa_i(private_child_create_t *this,
+								   message_t *message)
+{
+	if (install_child_sa(this) != SUCCESS)
+	{
+		handle_child_sa_failure(this, message);
+		return delete_failed_sa(this);
+	}
+
+	if (!this->rekey)
+	{	/* invoke the child_up() hook if we are not rekeying */
+		charon->bus->child_updown(charon->bus, this->child_sa, TRUE);
+	}
+	return SUCCESS;
+}
+
+METHOD(task_t, process_i_qske, status_t,
+	private_child_create_t *this, message_t *message)
+{
+	qske_payload_t *qske;
+
+	qske = (qske_payload_t*)message->get_payload(message, PLV2_QSKE);
+	if (!qske)
+	{
+		DBG1(DBG_IKE, "QSKE payload missing in message");
+		handle_child_sa_failure(this, message);
+		return delete_failed_sa(this);
+	}
+	if (!this->qske->set_ciphertext(this->qske, qske->get_qske_data(qske)))
+	{
+		DBG1(DBG_IKE, "failed to decrypt QSKE shared secret");
+		handle_child_sa_failure(this, message);
+		return delete_failed_sa(this);
+	}
+	return install_child_sa_i(this, message);
 }
 
 METHOD(task_t, process_i, status_t,
@@ -1664,20 +1820,20 @@ METHOD(task_t, process_i, status_t,
 		return delete_failed_sa(this);
 	}
 
-	if (select_data(this, no_dh, ike_auth) == SUCCESS &&
-		install_child_sa(this) == SUCCESS)
-	{
-		if (!this->rekey)
-		{	/* invoke the child_up() hook if we are not rekeying */
-			charon->bus->child_updown(charon->bus, this->child_sa, TRUE);
-		}
-	}
-	else
+	if (select_data(this, no_dh, ike_auth) != SUCCESS)
 	{
 		handle_child_sa_failure(this, message);
 		return delete_failed_sa(this);
 	}
-	return SUCCESS;
+
+	if (this->qske)
+	{	/* can't install the CHILD_SA yet, initiate IKE_AUX first */
+		this->public.task.build = _build_i_qske;
+		this->public.task.process = _process_i_qske;
+		return NEED_MORE;
+	}
+
+	return install_child_sa_i(this, message);
 }
 
 METHOD(child_create_t, use_reqid, void,
@@ -1748,6 +1904,7 @@ METHOD(task_t, migrate, void,
 	DESTROY_IF(this->child_sa);
 	DESTROY_IF(this->proposal);
 	DESTROY_IF(this->nonceg);
+	DESTROY_IF(this->qske);
 	DESTROY_IF(this->dh);
 	this->dh_failed = FALSE;
 	if (this->proposals)
@@ -1794,6 +1951,7 @@ METHOD(task_t, destroy, void,
 	DESTROY_IF(this->packet_tsi);
 	DESTROY_IF(this->packet_tsr);
 	DESTROY_IF(this->proposal);
+	DESTROY_IF(this->qske);
 	DESTROY_IF(this->dh);
 	if (this->proposals)
 	{
