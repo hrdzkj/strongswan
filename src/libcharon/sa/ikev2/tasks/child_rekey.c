@@ -73,6 +73,11 @@ struct private_child_rekey_t {
 	child_sa_t *child_sa;
 
 	/**
+	 * Original state of the CHILD_SA
+	 */
+	child_sa_state_t old_state;
+
+	/**
 	 * colliding task, may be delete or rekey
 	 */
 	task_t *collision;
@@ -158,8 +163,6 @@ METHOD(task_t, build_i, status_t,
 	private_child_rekey_t *this, message_t *message)
 {
 	notify_payload_t *notify;
-	uint32_t reqid;
-	child_cfg_t *config;
 
 	this->child_sa = this->ike_sa->get_child_sa(this->ike_sa, this->protocol,
 												this->spi, TRUE);
@@ -183,15 +186,16 @@ METHOD(task_t, build_i, status_t,
 		message->set_exchange_type(message, EXCHANGE_TYPE_UNDEFINED);
 		return SUCCESS;
 	}
-	config = this->child_sa->get_config(this->child_sa);
-
 
 	/* our CHILD_CREATE task does the hard work for us */
 	if (!this->child_create)
 	{
 		proposal_t *proposal;
+		child_cfg_t *config;
 		uint16_t dh_group;
+		uint32_t reqid;
 
+		config = this->child_sa->get_config(this->child_sa);
 		this->child_create = child_create_create(this->ike_sa,
 									config->get_ref(config), TRUE, NULL, NULL);
 
@@ -201,12 +205,12 @@ METHOD(task_t, build_i, status_t,
 		{	/* reuse the DH group negotiated previously */
 			this->child_create->use_dh_group(this->child_create, dh_group);
 		}
-	}
-	reqid = this->child_sa->get_reqid(this->child_sa);
-	this->child_create->use_reqid(this->child_create, reqid);
-	this->child_create->use_marks(this->child_create,
+		reqid = this->child_sa->get_reqid(this->child_sa);
+		this->child_create->use_reqid(this->child_create, reqid);
+		this->child_create->use_marks(this->child_create,
 						this->child_sa->get_mark(this->child_sa, TRUE).value,
 						this->child_sa->get_mark(this->child_sa, FALSE).value);
+	}
 
 	if (this->child_create->task.build(&this->child_create->task,
 									   message) != NEED_MORE)
@@ -234,9 +238,42 @@ METHOD(task_t, process_r, status_t,
 	/* let the CHILD_CREATE task process the message */
 	this->child_create->task.process(&this->child_create->task, message);
 
-	find_child(this, message);
-
+	if (message->get_exchange_type(message) == CREATE_CHILD_SA)
+	{
+		find_child(this, message);
+	}
 	return NEED_MORE;
+}
+
+/**
+ * Conclude the rekeying as responder
+ */
+static status_t conclude_rekey_r(private_child_rekey_t *this)
+{
+	child_sa_t *child_sa;
+
+	child_sa = this->child_create->get_child(this->child_create);
+	this->child_sa->set_state(this->child_sa, CHILD_REKEYED);
+	this->child_sa->set_rekey_spi(this->child_sa,
+								  child_sa->get_spi(child_sa, FALSE));
+
+	/* invoke rekey hook */
+	charon->bus->child_rekey(charon->bus, this->child_sa,
+							 this->child_create->get_child(this->child_create));
+	return SUCCESS;
+}
+
+METHOD(task_t, build_r_qske, status_t,
+	private_child_rekey_t *this, message_t *message)
+{
+	this->child_create->task.build(&this->child_create->task, message);
+
+	if (!message->get_payload(message, PLV2_QSKE))
+	{	/* rekeying failed, reuse old child */
+		this->child_sa->set_state(this->child_sa, this->old_state);
+		return SUCCESS;
+	}
+	return conclude_rekey_r(this);
 }
 
 METHOD(task_t, build_r, status_t,
@@ -244,8 +281,6 @@ METHOD(task_t, build_r, status_t,
 {
 	child_cfg_t *config;
 	uint32_t reqid;
-	child_sa_state_t state;
-	child_sa_t *child_sa;
 
 	if (!this->child_sa)
 	{
@@ -268,26 +303,27 @@ METHOD(task_t, build_r, status_t,
 						this->child_sa->get_mark(this->child_sa, FALSE).value);
 	config = this->child_sa->get_config(this->child_sa);
 	this->child_create->set_config(this->child_create, config->get_ref(config));
-	this->child_create->task.build(&this->child_create->task, message);
-
-	state = this->child_sa->get_state(this->child_sa);
+	/* FIXME: is that actually necessary? what states are possible? */
+	this->old_state = this->child_sa->get_state(this->child_sa);
 	this->child_sa->set_state(this->child_sa, CHILD_REKEYING);
 
-	if (message->get_payload(message, PLV2_SECURITY_ASSOCIATION) == NULL)
-	{	/* rekeying failed, reuse old child */
-		this->child_sa->set_state(this->child_sa, state);
-		return SUCCESS;
+	switch (this->child_create->task.build(&this->child_create->task, message))
+	{
+		case NEED_MORE:
+			/* QSKE case, we need to wait for the IKE_AUX exchange */
+			this->public.task.build = _build_r_qske;
+			return NEED_MORE;
+		case SUCCESS:
+		default:
+			break;
 	}
 
-	child_sa = this->child_create->get_child(this->child_create);
-	this->child_sa->set_state(this->child_sa, CHILD_REKEYED);
-	this->child_sa->set_rekey_spi(this->child_sa,
-								  child_sa->get_spi(child_sa, FALSE));
-
-	/* invoke rekey hook */
-	charon->bus->child_rekey(charon->bus, this->child_sa,
-							 this->child_create->get_child(this->child_create));
-	return SUCCESS;
+	if (!message->get_payload(message, PLV2_SECURITY_ASSOCIATION))
+	{	/* rekeying failed, reuse old child */
+		this->child_sa->set_state(this->child_sa, this->old_state);
+		return SUCCESS;
+	}
+	return conclude_rekey_r(this);
 }
 
 /**
@@ -365,6 +401,24 @@ static child_sa_t *handle_collision(private_child_rekey_t *this,
 	return to_delete;
 }
 
+/**
+ * Check if the rekeying was successful
+ */
+static bool rekeying_successful(message_t *msg)
+{
+	switch (msg->get_exchange_type(msg))
+	{
+		case CREATE_CHILD_SA:
+			return msg->get_payload(msg, PLV2_SECURITY_ASSOCIATION) != NULL;
+		case IKE_AUX:
+			return msg->get_payload(msg, PLV2_QSKE) != NULL;
+		case INFORMATIONAL:
+			/* forced delete by the child-create task */
+		default:
+			return FALSE;
+	}
+}
+
 METHOD(task_t, process_i, status_t,
 	private_child_rekey_t *this, message_t *message)
 {
@@ -414,10 +468,11 @@ METHOD(task_t, process_i, status_t,
 	if (this->child_create->task.process(&this->child_create->task,
 										 message) == NEED_MORE)
 	{
-		/* bad DH group while rekeying, retry, or failure requiring deletion */
+		/* bad DH group, QSKE case, or failure requiring deletion */
 		return NEED_MORE;
 	}
-	if (message->get_payload(message, PLV2_SECURITY_ASSOCIATION) == NULL)
+
+	if (!rekeying_successful(message))
 	{
 		/* establishing new child failed, reuse old and try again. but not when
 		 * we received a delete in the meantime */
