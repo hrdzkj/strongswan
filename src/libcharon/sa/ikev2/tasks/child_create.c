@@ -498,29 +498,24 @@ static linked_list_t* narrow_ts(private_child_create_t *this, bool local,
 }
 
 /**
- * Install a CHILD_SA for usage, return value:
+ * Select proposal and traffic selectors:
  * - FAILED: no acceptable proposal
  * - INVALID_ARG: diffie hellman group unacceptable
  * - NOT_FOUND: TS unacceptable
  */
-static status_t select_and_install(private_child_create_t *this,
-								   bool no_dh, bool ike_auth)
+static status_t select_data(private_child_create_t *this,
+							bool no_dh, bool ike_auth)
 {
-	status_t status, status_i, status_o;
-	child_sa_outbound_state_t out_state;
-	chunk_t nonce_i, nonce_r;
-	chunk_t encr_i = chunk_empty, encr_r = chunk_empty;
-	chunk_t integ_i = chunk_empty, integ_r = chunk_empty;
 	linked_list_t *my_ts, *other_ts;
 	host_t *me, *other;
 	bool private, prefer_configured;
 
-	if (this->proposals == NULL)
+	if (!this->proposals)
 	{
 		DBG1(DBG_IKE, "SA payload missing in message");
 		return FAILED;
 	}
-	if (this->tsi == NULL || this->tsr == NULL)
+	if (!this->tsi || !this->tsr)
 	{
 		DBG1(DBG_IKE, "TS payloads missing in message");
 		return NOT_FOUND;
@@ -534,7 +529,7 @@ static status_t select_and_install(private_child_create_t *this,
 							"%s.prefer_configured_proposals", TRUE, lib->ns);
 	this->proposal = this->config->select_proposal(this->config,
 							this->proposals, no_dh, private, prefer_configured);
-	if (this->proposal == NULL)
+	if (!this->proposal)
 	{
 		DBG1(DBG_IKE, "no acceptable proposal found");
 		charon->bus->alert(charon->bus, ALERT_PROPOSAL_MISMATCH_CHILD,
@@ -578,15 +573,11 @@ static status_t select_and_install(private_child_create_t *this,
 
 	if (this->initiator)
 	{
-		nonce_i = this->my_nonce;
-		nonce_r = this->other_nonce;
 		my_ts = narrow_ts(this, TRUE, this->tsi);
 		other_ts = narrow_ts(this, FALSE, this->tsr);
 	}
 	else
 	{
-		nonce_r = this->my_nonce;
-		nonce_i = this->other_nonce;
 		my_ts = narrow_ts(this, TRUE, this->tsr);
 		other_ts = narrow_ts(this, FALSE, this->tsi);
 	}
@@ -694,17 +685,45 @@ static status_t select_and_install(private_child_create_t *this,
 							  offsetof(traffic_selector_t, destroy));
 	}
 
-	this->child_sa->set_state(this->child_sa, CHILD_INSTALLING);
 	this->child_sa->set_ipcomp(this->child_sa, this->ipcomp);
 	this->child_sa->set_mode(this->child_sa, this->mode);
 	this->child_sa->set_protocol(this->child_sa,
 								 this->proposal->get_protocol(this->proposal));
 
-	if (this->my_cpi == 0 || this->other_cpi == 0 || this->ipcomp == IPCOMP_NONE)
+	if (this->my_cpi == 0 || this->other_cpi == 0 ||
+		this->ipcomp == IPCOMP_NONE)
 	{
 		this->my_cpi = this->other_cpi = 0;
 		this->ipcomp = IPCOMP_NONE;
 	}
+	return SUCCESS;
+}
+
+/**
+ * Installs a CHILD_SA for usage
+ */
+static status_t install_child_sa(private_child_create_t *this)
+{
+	status_t status, status_i, status_o;
+	child_sa_outbound_state_t out_state;
+	chunk_t nonce_i, nonce_r;
+	chunk_t encr_i = chunk_empty, encr_r = chunk_empty;
+	chunk_t integ_i = chunk_empty, integ_r = chunk_empty;
+	linked_list_t *my_ts, *other_ts;
+
+	this->child_sa->set_state(this->child_sa, CHILD_INSTALLING);
+
+	if (this->initiator)
+	{
+		nonce_i = this->my_nonce;
+		nonce_r = this->other_nonce;
+	}
+	else
+	{
+		nonce_r = this->my_nonce;
+		nonce_i = this->other_nonce;
+	}
+
 	status_i = status_o = FAILED;
 	if (this->keymat->derive_child_keys(this->keymat, this->proposal,
 			this->dh, nonce_i, nonce_r, &encr_i, &integ_i, &encr_r, &integ_r))
@@ -1408,10 +1427,8 @@ METHOD(task_t, build_r, status_t,
 		}
 	}
 
-	switch (select_and_install(this, no_dh, ike_auth))
+	switch (select_data(this, no_dh, ike_auth))
 	{
-		case SUCCESS:
-			break;
 		case NOT_FOUND:
 			message->add_notify(message, FALSE, TS_UNACCEPTABLE, chunk_empty);
 			handle_child_sa_failure(this, message);
@@ -1423,6 +1440,12 @@ METHOD(task_t, build_r, status_t,
 								chunk_from_thing(group));
 			return SUCCESS;
 		}
+		case SUCCESS:
+			if (install_child_sa(this) == SUCCESS)
+			{
+				break;
+			}
+			/* fall-through */
 		case FAILED:
 		default:
 			message->add_notify(message, FALSE, NO_PROPOSAL_CHOSEN, chunk_empty);
@@ -1641,7 +1664,8 @@ METHOD(task_t, process_i, status_t,
 		return delete_failed_sa(this);
 	}
 
-	if (select_and_install(this, no_dh, ike_auth) == SUCCESS)
+	if (select_data(this, no_dh, ike_auth) == SUCCESS &&
+		install_child_sa(this) == SUCCESS)
 	{
 		if (!this->rekey)
 		{	/* invoke the child_up() hook if we are not rekeying */
