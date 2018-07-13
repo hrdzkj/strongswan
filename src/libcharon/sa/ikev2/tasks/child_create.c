@@ -725,8 +725,8 @@ static status_t install_child_sa(private_child_create_t *this)
 	}
 
 	status_i = status_o = FAILED;
-	if (this->keymat->derive_child_keys(this->keymat, this->proposal,
-			this->dh, nonce_i, nonce_r, &encr_i, &integ_i, &encr_r, &integ_r))
+	if (this->keymat->derive_child_keys(this->keymat, this->proposal, this->dh,
+			NULL, nonce_i, nonce_r, &encr_i, &integ_i, &encr_r, &integ_r))
 	{
 		if (this->initiator)
 		{
